@@ -99,6 +99,9 @@ pub const MAX_INSERTABLE_INSTRUCTION_DATA: usize = 1232 - INSERT_TRANSACTION_OVE
 ///
 /// This holds ONLY while a transaction draws on one lookup table. A second
 /// contributing table costs ~35 more bytes and drops the ceiling to ~963.
+/// Documents the 998 that `--max-instruction-bytes` defaults to; the CLI spells
+/// the literal out so its `--help` text can show it.
+#[allow(dead_code)]
 pub const MAX_INSERTABLE_INSTRUCTION_DATA_V0: usize = 1232 - 234;
 
 pub fn anchor_discriminator(preimage: &str) -> [u8; 8] {
