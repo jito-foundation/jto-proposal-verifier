@@ -1,0 +1,19 @@
+[package]
+name = "jto-proposal-verifier"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only verifier for JTO DAO jitoSOL vote-override proposals"
+license = "Apache-2.0"
+
+[[bin]]
+name = "verify_proposal"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.21"
+borsh = "0.10"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+solana-client = "~1.18"
+solana-sdk = "~1.18"
