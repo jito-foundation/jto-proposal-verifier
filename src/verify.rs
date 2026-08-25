@@ -1,34 +1,35 @@
 //! Checks whether a jitoSOL vote-override proposal can actually be submitted and
 //! executed, against live chain state.
 //!
-//! The account layouts come from `crate::governance` rather than the
-//! borsh-0.9-patched `spl-governance` dependency tree; see that module for why.
-//!
-//! Note on check 3: the for/against/abstain split must be *unanimous within each
-//! svmgov proposal*, and is printed per proposal. Checking only one instruction's
-//! split would not catch a single instruction among ~900 that votes the opposite
-//! way — it sums to 10000 bp like all the others and passes every other check.
+//! Ported from Jito's proposal tooling so both report identically; only the
+//! account-layout import below differs, pointing at `crate::governance`.
 
 use std::{path::PathBuf, str::FromStr};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::BorshDeserialize;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 
 use crate::governance::{
-    get_proposal_transaction_address, InstructionData, ProposalTransactionV2, ProposalV2,
-};
-use crate::svmgov::{
-    anchor_discriminator, fold_merkle_proof, sha256, SvmgovProposal, BASIS_POINTS_MAX,
+    get_proposal_transaction_address, GovernanceV2, InstructionData, ProposalTransactionV2,
+    ProposalV2,
 };
 
-/// Records one failed precondition.
-struct Problem {
-    check: &'static str,
-    detail: String,
-}
+use crate::{
+    invariants::{
+        canonical_digest, check_invariants, distinct_stake, unexpected_options, vote_tally,
+        DecodedOverride, InvariantParams, Problem, VoteSplit,
+    },
+    svmgov::{anchor_discriminator, fold_merkle_proof, sha256, SvmgovProposal},
+    timestamp::{format_utc, humanise_seconds},
+};
+
+/// How far past the check the payload must stay executable when no horizon is given.
+/// A verifier that only asks "is it valid right now" answers a question nobody needs:
+/// the payload is signed now and executed later.
+pub const DEFAULT_HORIZON_SECONDS: i64 = 72 * 3_600;
 
 /// Decoded `ncn_snapshot::MetaMerkleProof` account data.
 struct OnChainMetaProof {
@@ -67,25 +68,6 @@ fn decode_meta_merkle_proof(data: &[u8]) -> Result<OnChainMetaProof> {
     })
 }
 
-/// One decoded `cast_vote_override` from the proposal.
-struct DecodedOverride {
-    index: usize,
-    size: usize,
-    signer: Pubkey,
-    svmgov_proposal: Pubkey,
-    vote_account: Pubkey,
-    vote_override: Pubkey,
-    stake_account: Pubkey,
-    consensus_result: Pubkey,
-    meta_merkle_proof: Pubkey,
-    voting_wallet: Pubkey,
-    active_stake: u64,
-    stake_proof: Vec<[u8; 32]>,
-    for_bp: u64,
-    against_bp: u64,
-    abstain_bp: u64,
-}
-
 /// Extracts the proposal address from a Realms URL or accepts a bare address.
 fn parse_realms_proposal(value: &str) -> Result<Pubkey> {
     let trimmed = value
@@ -104,7 +86,7 @@ fn parse_realms_proposal(value: &str) -> Result<Pubkey> {
 fn load_onchain_instructions(
     state: &GovernanceContext,
     proposal: &Pubkey,
-) -> Result<(Vec<InstructionData>, Vec<Problem>)> {
+) -> Result<(Vec<InstructionData>, Vec<Problem>, Option<i64>)> {
     let mut problems = Vec::new();
     let data = state
         .rpc
@@ -126,36 +108,65 @@ fn load_onchain_instructions(
         });
     }
 
-    let option = parsed
-        .options
-        .first()
-        .ok_or_else(|| anyhow!("proposal {proposal} has no options"))?;
-    let expected = option.transactions_count;
-    println!(
-        "  transactions       : {expected} declared, {} executed",
-        option.transactions_executed_count
-    );
+    if parsed.options.is_empty() {
+        bail!("proposal {proposal} has no options");
+    }
+    // Every option, not just option 0. Under SingleChoice the resolver picks the
+    // winning option by vote weight, so an option this tool never reads is exactly
+    // the one that could execute. The audited creation path only ever builds option
+    // 0, which makes anything under a higher option a finding rather than a variant.
+    println!("  options            : {}", parsed.options.len());
+    // Flagged up front, before any of them is read, so an option carrying transactions
+    // is reported even if fetching its accounts later fails.
+    for index in unexpected_options(
+        &parsed
+            .options
+            .iter()
+            .map(|option| option.transactions_count)
+            .collect::<Vec<_>>(),
+    ) {
+        problems.push(Problem {
+            check: "unexpected option",
+            detail: format!(
+                "option {index} ({}) carries {} transaction(s); the generator only ever \
+                 populates option 0, so these were added by something else and are not \
+                 covered by the reviewed payload",
+                parsed.options[index].label, parsed.options[index].transactions_count
+            ),
+        });
+    }
 
     let mut instructions = Vec::new();
     let mut missing = Vec::new();
     let mut executed = 0usize;
-    for index in 0..expected {
-        let address = get_proposal_transaction_address(
-            &state.program_id,
-            proposal,
-            &0u8.to_le_bytes(),
-            &index.to_le_bytes(),
+    let mut max_hold_up = 0u32;
+    for (option_index, option) in parsed.options.iter().enumerate() {
+        let expected = option.transactions_count;
+        println!(
+            "    option {option_index} ({}) : {expected} declared, {} executed",
+            option.label, option.transactions_executed_count
         );
-        match state.rpc.get_account_data(&address) {
-            Ok(bytes) => {
-                let transaction = ProposalTransactionV2::deserialize(&mut &bytes[..])
-                    .with_context(|| format!("borsh-decoding ProposalTransaction {address}"))?;
-                if transaction.executed_at.is_some() {
-                    executed += 1;
+        let option_seed = u8::try_from(option_index)
+            .map_err(|_| anyhow!("proposal has more than 255 options"))?;
+        for index in 0..expected {
+            let address = get_proposal_transaction_address(
+                &state.program_id,
+                proposal,
+                &option_seed.to_le_bytes(),
+                &index.to_le_bytes(),
+            );
+            match state.rpc.get_account_data(&address) {
+                Ok(bytes) => {
+                    let transaction = ProposalTransactionV2::deserialize(&mut &bytes[..])
+                        .with_context(|| format!("borsh-decoding ProposalTransaction {address}"))?;
+                    if transaction.executed_at.is_some() {
+                        executed += 1;
+                    }
+                    max_hold_up = max_hold_up.max(transaction.hold_up_time);
+                    instructions.extend(transaction.instructions);
                 }
-                instructions.extend(transaction.instructions);
+                Err(_) => missing.push((option_index, index)),
             }
-            Err(_) => missing.push(index),
         }
     }
     // A gap means an insert never landed — the proposal looks complete in the UI
@@ -164,7 +175,8 @@ fn load_onchain_instructions(
         problems.push(Problem {
             check: "missing transactions",
             detail: format!(
-                "{} of {expected} ProposalTransaction account(s) do not exist (first few: {:?})",
+                "{} ProposalTransaction account(s) do not exist (first few, as \
+                 option/index: {:?})",
                 missing.len(),
                 &missing[..missing.len().min(5)]
             ),
@@ -173,7 +185,72 @@ fn load_onchain_instructions(
     if executed > 0 {
         println!("  already executed   : {executed} transaction(s)");
     }
-    Ok((instructions, problems))
+
+    // The earliest moment the chain will let this execute. Derived, not guessed: a
+    // proof that closes before this can never be used, no matter when anyone acts.
+    let earliest_execution =
+        derive_earliest_execution(state, &parsed, max_hold_up).unwrap_or_else(|err| {
+            println!("  execution window   : not derivable ({err:#})");
+            None
+        });
+    if let Some(at) = earliest_execution {
+        println!(
+            "  can execute from   : {} (hold-up {max_hold_up}s)",
+            format_utc(at)
+        );
+    }
+    Ok((instructions, problems, earliest_execution))
+}
+
+/// Prints the verdict and its reasons.
+///
+/// The list is capped: a wholly malformed payload produces one problem per instruction,
+/// and 882 lines of the same message buries anything else that was found.
+fn print_verdict(problems: &[Problem]) {
+    const SHOWN: usize = 20;
+    println!();
+    if problems.is_empty() {
+        println!("EXECUTABLE — every precondition checked out.");
+        return;
+    }
+    println!("NOT EXECUTABLE — {} problem(s):", problems.len());
+    for problem in problems.iter().take(SHOWN) {
+        println!("  [{}] {}", problem.check, problem.detail);
+    }
+    if let Some(hidden) = problems.len().checked_sub(SHOWN).filter(|n| *n > 0) {
+        println!("  ... and {hidden} more");
+    }
+}
+
+/// When the chain will first allow `ExecuteTransaction`, from the proposal's own state.
+///
+/// A proposal still in Voting has not fixed its completion time, so the latest possible
+/// end of voting is used — the conservative choice, since assuming an earlier deadline
+/// would understate how long the proofs must survive.
+fn derive_earliest_execution(
+    state: &GovernanceContext,
+    proposal: &ProposalV2,
+    hold_up: u32,
+) -> Result<Option<i64>> {
+    if let Some(completed) = proposal.voting_completed_at {
+        return Ok(Some(completed + hold_up as i64));
+    }
+    let Some(voting_at) = proposal.voting_at else {
+        // Still a draft: nothing has started, so there is no window to compute.
+        return Ok(None);
+    };
+    let data = state
+        .rpc
+        .get_account_data(&proposal.governance)
+        .with_context(|| format!("fetching governance {}", proposal.governance))?;
+    let governance =
+        GovernanceV2::deserialize(&mut &data[..]).context("borsh-decoding GovernanceV2")?;
+    let base = proposal
+        .max_voting_time
+        .unwrap_or(governance.config.voting_base_time) as i64;
+    Ok(Some(
+        voting_at + base + governance.config.voting_cool_off_time as i64 + hold_up as i64,
+    ))
 }
 
 /// Everything the checks need about the DAO, so this module does not depend on
@@ -186,6 +263,26 @@ pub struct GovernanceContext<'a> {
     pub native_treasury: Pubkey,
 }
 
+/// What a verification run concluded, returned rather than only printed.
+///
+/// `NOT EXECUTABLE` used to exit 0, so nothing automated could gate on the verdict.
+/// The caller now decides the exit status, and `--report` renders from these fields
+/// instead of re-deriving them.
+pub struct Verdict {
+    pub problems: Vec<Problem>,
+    pub instructions: usize,
+    pub stake_accounts: usize,
+    pub total_stake: u64,
+    pub votes: std::collections::BTreeMap<VoteSplit, Vec<usize>>,
+    pub digest: String,
+}
+
+impl Verdict {
+    pub fn executable(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
 pub fn verify_proposal(
     state: &GovernanceContext,
     proposal_path: Option<&PathBuf>,
@@ -193,7 +290,10 @@ pub fn verify_proposal(
     svmgov_program_id: &Pubkey,
     snapshot_program_id: &Pubkey,
     max_instruction_bytes: usize,
-) -> Result<()> {
+    execution_horizon: Option<i64>,
+) -> Result<Verdict> {
+    // Set only on the on-chain path; an artifact has no voting schedule to derive from.
+    let mut execution_at: Option<i64> = None;
     // Size only gates submission. Instructions already on-chain cleared it by
     // definition, so the budget check is skipped for the on-chain path.
     let (raw_instructions, mut problems, check_size) = match (proposal_path, realms_url) {
@@ -220,109 +320,73 @@ pub fn verify_proposal(
         }
         (None, Some(url)) => {
             let address = parse_realms_proposal(url)?;
-            let (instructions, problems) = load_onchain_instructions(state, &address)?;
+            let (instructions, problems, earliest) = load_onchain_instructions(state, &address)?;
+            execution_at = earliest;
             (instructions, problems, false)
         }
         _ => bail!("pass exactly one of --proposal or --realms-url"),
     };
 
-    let discriminator = anchor_discriminator("global:cast_vote_override");
-    let mut overrides = Vec::new();
-    // Keyed on the vote_override PDA, which is what `init` requires to be unique.
-    // A stake account legitimately repeats across bundled svmgov proposals.
-    let mut seen_override = std::collections::BTreeSet::new();
-
     // --- 1. shape --------------------------------------------------------
-    for (index, instruction) in raw_instructions.iter().enumerate() {
-        let encoded_len = instruction
-            .try_to_vec()
-            .map(|bytes| bytes.len())
-            .unwrap_or(usize::MAX);
-
-        let mut fail = |detail: String| {
-            problems.push(Problem {
-                check: "instruction shape",
-                detail: format!("ix {index}: {detail}"),
-            })
-        };
-        if instruction.program_id != *svmgov_program_id {
-            fail(format!("program id {}", instruction.program_id));
-            continue;
-        }
-        if instruction.accounts.len() != 11 {
-            fail(format!(
-                "{} accounts, expected 11",
-                instruction.accounts.len()
-            ));
-            continue;
-        }
-        let data = &instruction.data;
-        if data.len() < 36 || data[..8] != discriminator {
-            fail("wrong discriminator".to_string());
-            continue;
-        }
-        let for_bp = u64::from_le_bytes(data[8..16].try_into().unwrap());
-        let against_bp = u64::from_le_bytes(data[16..24].try_into().unwrap());
-        let abstain_bp = u64::from_le_bytes(data[24..32].try_into().unwrap());
-        if for_bp + against_bp + abstain_bp != BASIS_POINTS_MAX {
-            fail(format!("vote split {for_bp}/{against_bp}/{abstain_bp}"));
-            continue;
-        }
-        let nodes = u32::from_le_bytes(data[32..36].try_into().unwrap()) as usize;
-        let leaf_at = 36 + 32 * nodes;
-        if data.len() != leaf_at + 72 {
-            fail("payload length does not match declared proof length".to_string());
-            continue;
-        }
-        let stake_proof = (0..nodes)
-            .map(|i| data[36 + 32 * i..68 + 32 * i].try_into().unwrap())
-            .collect::<Vec<[u8; 32]>>();
-        let voting_wallet = Pubkey::new_from_array(data[leaf_at..leaf_at + 32].try_into().unwrap());
-        let leaf_stake =
-            Pubkey::new_from_array(data[leaf_at + 32..leaf_at + 64].try_into().unwrap());
-        let active_stake = u64::from_le_bytes(data[leaf_at + 64..leaf_at + 72].try_into().unwrap());
-
-        let accounts = &instruction.accounts;
-        if !accounts[0].is_signer || !accounts[0].is_writable {
-            fail("account 0 must be a writable signer".to_string());
-        }
-        if accounts[0].pubkey != voting_wallet {
-            fail("signer does not match the leaf voting_wallet".to_string());
-        }
-        if accounts[6].pubkey != leaf_stake {
-            fail("stake account does not match the leaf".to_string());
-        }
-        if !seen_override.insert(accounts[4].pubkey) {
-            fail(format!(
-                "duplicate vote_override {} (stake {leaf_stake})",
-                accounts[4].pubkey
-            ));
-        }
-
-        overrides.push(DecodedOverride {
-            index,
-            size: encoded_len,
-            signer: accounts[0].pubkey,
-            svmgov_proposal: accounts[1].pubkey,
-            vote_account: accounts[3].pubkey,
-            vote_override: accounts[4].pubkey,
-            stake_account: accounts[6].pubkey,
-            consensus_result: accounts[8].pubkey,
-            meta_merkle_proof: accounts[9].pubkey,
-            voting_wallet,
-            active_stake,
-            stake_proof,
-            for_bp,
-            against_bp,
-            abstain_bp,
+    // Every rule that needs nothing but the payload lives in `invariants`, which is
+    // pure and unit-tested. Below this point the checks need the chain.
+    let params = InvariantParams {
+        svmgov_program_id: *svmgov_program_id,
+        discriminator: anchor_discriminator("global:cast_vote_override"),
+    };
+    let (overrides, shape_problems) = check_invariants(&raw_instructions, &params);
+    problems.extend(shape_problems);
+    // Fingerprint of how this run *interpreted* the payload, for comparison against an
+    // independent implementation. Equal digests mean equal readings, not equal bytes.
+    let digest = canonical_digest(&raw_instructions);
+    if overrides.is_empty() {
+        // Every instruction failed. That is a verdict, not an inability to check, so it
+        // has to exit like one: bailing here reported exit 1 ("could not complete") for
+        // a payload that is definitively wrong.
+        problems.push(Problem {
+            check: "payload",
+            detail: format!(
+                "none of the {} instruction(s) decoded as a valid cast_vote_override",
+                raw_instructions.len()
+            ),
+        });
+        println!("  invariant digest   : {digest}");
+        print_verdict(&problems);
+        return Ok(Verdict {
+            problems,
+            instructions: 0,
+            stake_accounts: 0,
+            total_stake: 0,
+            votes: std::collections::BTreeMap::new(),
+            digest,
         });
     }
-    if overrides.is_empty() {
-        bail!("no decodable cast_vote_override instructions found");
-    }
-    let total_stake: u64 = overrides.iter().map(|o| o.active_stake).sum();
+    let (stake_accounts, total_stake) = distinct_stake(&overrides);
     println!("  instructions       : {}", overrides.len());
-    println!("  stake              : {:.0} SOL", total_stake as f64 / 1e9);
+    // Counted per stake account, not per instruction. The payload bundles three
+    // svmgov proposals, so summing instructions reports three times the real weight.
+    println!(
+        "  stake              : {:.0} SOL across {stake_accounts} stake account(s)",
+        total_stake as f64 / 1e9
+    );
+    // Every distinct vote, not just instruction 0's. Printing only the first is how a
+    // payload with one instruction flipped rendered identically to a clean one.
+    let tally = vote_tally(&overrides);
+    for (vote, indices) in &tally {
+        println!(
+            "  vote               : {vote} on {} instruction(s){}",
+            indices.len(),
+            if tally.len() > 1 {
+                format!(
+                    " (first: ix {})",
+                    indices.first().copied().unwrap_or_default()
+                )
+            } else {
+                String::new()
+            }
+        );
+    }
+    println!("  invariant digest   : {digest}");
 
     // --- 2. signer authority --------------------------------------------
     let signers = overrides
@@ -358,50 +422,18 @@ pub fn verify_proposal(
             .with_context(|| format!("fetching svmgov proposal {svmgov_proposal}"))?;
         let svm = SvmgovProposal::deserialize(&mut &proposal_data[8..])
             .context("borsh-decoding svmgov Proposal")?;
-        // Every instruction for one svmgov proposal casts part of the same vote,
-        // so they must all carry the same split. A bundle may legitimately vote
-        // differently on *different* SGPs, which is why this groups per proposal
-        // rather than globally. A mixed split means some of the pool's stake
-        // votes the opposite way to the title — invisible in the Realms UI, and
-        // it would execute exactly as written.
-        let mut by_split: std::collections::BTreeMap<(u64, u64, u64), Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for o in overrides
+        let group = overrides
             .iter()
             .filter(|o| o.svmgov_proposal == *svmgov_proposal)
-        {
-            by_split
-                .entry((o.for_bp, o.against_bp, o.abstain_bp))
-                .or_default()
-                .push(o.index);
-        }
-        let count: usize = by_split.values().map(|indices| indices.len()).sum();
-        let split = if by_split.len() == 1 {
-            let (for_bp, against_bp, abstain_bp) = *by_split.keys().next().unwrap();
-            format!("{for_bp}/{against_bp}/{abstain_bp} bp")
-        } else {
-            problems.push(Problem {
-                check: "vote split",
-                detail: format!(
-                    "{svmgov_proposal} mixes {} for/against/abstain splits across its {count} \
-                     instructions: {}",
-                    by_split.len(),
-                    by_split
-                        .iter()
-                        .map(|((for_bp, against_bp, abstain_bp), indices)| format!(
-                            "{for_bp}/{against_bp}/{abstain_bp} bp on {} ix (e.g. {:?})",
-                            indices.len(),
-                            &indices[..indices.len().min(3)]
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            });
-            format!("{} MIXED SPLITS", by_split.len())
-        };
+            .collect::<Vec<_>>();
+        let (accounts, stake) = distinct_stake(group.iter().copied());
         println!(
-            "    {svmgov_proposal}  {count} ix  {split}  epochs [{}, {})  {}",
-            svm.start_epoch, svm.end_epoch, svm.title
+            "    {svmgov_proposal}  {} ix  {accounts} stake  {:.0} SOL  epochs [{}, {})  {}",
+            group.len(),
+            stake as f64 / 1e9,
+            svm.start_epoch,
+            svm.end_epoch,
+            svm.title
         );
         if svm.finalized {
             problems.push(Problem {
@@ -485,8 +517,35 @@ pub fn verify_proposal(
         .rpc
         .get_block_time(state.rpc.get_slot().context("fetching slot")?)
         .context("fetching chain clock")?;
+    let horizon = execution_horizon.unwrap_or(now + DEFAULT_HORIZON_SECONDS);
+    println!("  chain time         : {}", format_utc(now));
+    println!(
+        "  execution horizon  : {} ({})",
+        format_utc(horizon),
+        if execution_horizon.is_some() {
+            "given"
+        } else {
+            "default: chain time + 72h"
+        }
+    );
+    if horizon < now {
+        problems.push(Problem {
+            check: "execution horizon",
+            detail: format!(
+                "horizon {} is already in the past (chain time {})",
+                format_utc(horizon),
+                format_utc(now)
+            ),
+        });
+    }
     let mut missing = 0usize;
-    let mut expiring = 0usize;
+    // Collected as references, not counted: what a reader needs is how much stake is
+    // at risk, and that has to be deduplicated across the three bundled proposals.
+    let mut expired: Vec<&DecodedOverride> = Vec::new();
+    // Separate from `expired`: a proof still alive now but closeable before the vote
+    // executes is the case that used to read as EXECUTABLE right up until it wasn't.
+    let mut closeable_before_horizon: Vec<&DecodedOverride> = Vec::new();
+    let mut earliest_close: Option<i64> = None;
     let mut tier1_bad = 0usize;
     let mut tier2_bad = 0usize;
     let mut already_cast = 0usize;
@@ -541,10 +600,18 @@ pub fn verify_proposal(
                 });
                 continue;
             }
-            // Closeable before the vote ends means someone could reclaim the rent
-            // and delete a proof this proposal still needs.
+            // Closeable before the vote ends means anyone can reclaim the rent and
+            // delete a proof this proposal still needs. Measured against the horizon,
+            // not the moment of the check.
             if decoded.close_timestamp <= now {
-                expiring += 1;
+                expired.push(o);
+            } else if decoded.close_timestamp <= horizon {
+                closeable_before_horizon.push(o);
+            }
+            if decoded.close_timestamp > now {
+                earliest_close = Some(earliest_close.map_or(decoded.close_timestamp, |e: i64| {
+                    e.min(decoded.close_timestamp)
+                }));
             }
 
             // Tier 1: meta leaf -> consensus root.
@@ -594,21 +661,65 @@ pub fn verify_proposal(
         "  merkle tier 2      : {} verified",
         overrides.len() - missing - tier2_bad
     );
-    if expiring > 0 {
-        println!(
-            "  WARNING            : {expiring} proof account(s) are already past close_timestamp"
-        );
+    if let Some(earliest) = earliest_close {
+        println!("  earliest proof close: {}", format_utc(earliest));
+        // The unambiguous case, needing no judgement about scheduling: a proof that
+        // closes before the chain will even permit execution can never be used.
+        if let Some(execution_at) = execution_at {
+            if earliest <= execution_at {
+                problems.push(Problem {
+                    check: "execution window",
+                    detail: format!(
+                        "proof(s) start closing at {} but this cannot execute until {}; \
+                         the payload can never fully execute",
+                        format_utc(earliest),
+                        format_utc(execution_at)
+                    ),
+                });
+            } else {
+                println!(
+                    "  execution window   : {} wide ({} → {})",
+                    humanise_seconds(earliest - execution_at),
+                    format_utc(execution_at),
+                    format_utc(earliest)
+                );
+            }
+        }
+    }
+    for (affected, when) in [
+        (&expired, "are already past close_timestamp".to_string()),
+        (
+            &closeable_before_horizon,
+            format!(
+                "become closeable before the horizon {}",
+                format_utc(horizon)
+            ),
+        ),
+    ] {
+        if affected.is_empty() {
+            continue;
+        }
+        let (accounts, stake) = distinct_stake(affected.iter().copied());
+        problems.push(Problem {
+            check: "proof expiry",
+            detail: format!(
+                "{accounts} stake account(s) carrying {:.0} SOL ({:.2}% of the vote) \
+                 rely on proof(s) that {when} — anyone can close them and reclaim the \
+                 rent, and the instruction then fails",
+                stake as f64 / 1e9,
+                100.0 * stake as f64 / total_stake.max(1) as f64,
+            ),
+        });
     }
 
     // --- verdict ----------------------------------------------------------
-    println!();
-    if problems.is_empty() {
-        println!("EXECUTABLE — every precondition checked out.");
-        return Ok(());
-    }
-    println!("NOT EXECUTABLE — {} problem(s):", problems.len());
-    for problem in &problems {
-        println!("  [{}] {}", problem.check, problem.detail);
-    }
-    Ok(())
+    print_verdict(&problems);
+    Ok(Verdict {
+        problems,
+        instructions: overrides.len(),
+        stake_accounts,
+        total_stake,
+        votes: tally,
+        digest,
+    })
 }

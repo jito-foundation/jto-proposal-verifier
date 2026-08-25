@@ -168,6 +168,47 @@ pub struct ProposalV2 {
     pub veto_vote_weight: u64,
 }
 
+/// `spl_governance::state::enums::VoteTipping`.
+#[derive(Clone, Debug, PartialEq, Eq, BorshDeserialize, BorshSerialize)]
+pub enum VoteTipping {
+    Strict,
+    Early,
+    Disabled,
+}
+
+/// `spl_governance::state::governance::GovernanceConfig`.
+#[derive(Clone, Debug, PartialEq, Eq, BorshDeserialize, BorshSerialize)]
+pub struct GovernanceConfig {
+    pub community_vote_threshold: VoteThreshold,
+    pub min_community_weight_to_create_proposal: u64,
+    pub min_transaction_hold_up_time: u32,
+    pub voting_base_time: u32,
+    pub community_vote_tipping: VoteTipping,
+    pub council_vote_threshold: VoteThreshold,
+    pub council_veto_vote_threshold: VoteThreshold,
+    pub min_council_weight_to_create_proposal: u64,
+    pub council_vote_tipping: VoteTipping,
+    pub community_veto_vote_threshold: VoteThreshold,
+    pub voting_cool_off_time: u32,
+    pub deposit_exempt_proposal_count: u8,
+}
+
+/// `spl_governance::state::governance::GovernanceV2`.
+///
+/// The verifier reads `config.voting_base_time` and `config.voting_cool_off_time`
+/// to project when a proposal could earliest execute.
+#[derive(Clone, Debug, PartialEq, Eq, BorshDeserialize, BorshSerialize)]
+pub struct GovernanceV2 {
+    pub account_type: GovernanceAccountType,
+    pub realm: Pubkey,
+    pub governed_account: Pubkey,
+    pub reserved1: u32,
+    pub config: GovernanceConfig,
+    /// `spl_governance::state::legacy::Reserved120` — a 120-byte reserved block.
+    pub reserved_v2: [u8; 120],
+    pub active_proposal_count: u64,
+}
+
 /// `spl_governance::state::proposal_transaction::AccountMetaData`.
 #[derive(Clone, Debug, PartialEq, Eq, BorshDeserialize, BorshSerialize)]
 pub struct AccountMetaData {
@@ -201,6 +242,23 @@ pub struct ProposalTransactionV2 {
     pub reserved_v2: [u8; 8],
 }
 
+/// `spl_governance::state::proposal_transaction::get_proposal_transaction_address_seeds`.
+///
+/// The option index is part of the seed, so each proposal option addresses its
+/// own set of transaction accounts.
+pub fn get_proposal_transaction_address_seeds<'a>(
+    proposal: &'a Pubkey,
+    option_index: &'a [u8; 1],
+    instruction_index_le_bytes: &'a [u8; 2],
+) -> [&'a [u8]; 4] {
+    [
+        PROGRAM_AUTHORITY_SEED,
+        proposal.as_ref(),
+        option_index,
+        instruction_index_le_bytes,
+    ]
+}
+
 /// `spl_governance::state::proposal_transaction::get_proposal_transaction_address`.
 pub fn get_proposal_transaction_address(
     program_id: &Pubkey,
@@ -209,12 +267,11 @@ pub fn get_proposal_transaction_address(
     instruction_index_le_bytes: &[u8; 2],
 ) -> Pubkey {
     Pubkey::find_program_address(
-        &[
-            PROGRAM_AUTHORITY_SEED,
-            proposal.as_ref(),
+        &get_proposal_transaction_address_seeds(
+            proposal,
             option_index_le_bytes,
             instruction_index_le_bytes,
-        ],
+        ),
         program_id,
     )
     .0
